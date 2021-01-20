@@ -3,21 +3,24 @@
 from __future__ import unicode_literals, print_function, division
 
 import sys
-
-reload(sys)
-sys.setdefaultencoding('utf8')
-
+import importlib
+importlib.reload(sys)
+sys.path.append('../')
+#sys.setdefaultencoding('utf8')
+import argparse
 import os
 import time
-
+import rouge
+from rouge import Rouge
 import torch
 from torch.autograd import Variable
 
+from data_util.log import logger
 from data_util.batcher import Batcher
 from data_util.data import Vocab
 from data_util import data, config
 from model import Model
-from data_util.utils import write_for_rouge, rouge_eval, rouge_log
+from data_util.utils import write_for_rouge, rouge_eval, rouge_log, make_html_safe
 from train_util import get_input_from_batch
 
 
@@ -50,6 +53,7 @@ class Beam(object):
 class BeamSearch(object):
     def __init__(self, model_file_path):
         model_name = os.path.basename(model_file_path)
+        self.model_path_name = model_name       
         self._decode_dir = os.path.join(config.log_root, 'decode_%s' % (model_name))
         self._rouge_ref_dir = os.path.join(self._decode_dir, 'rouge_ref')
         self._rouge_dec_dir = os.path.join(self._decode_dir, 'rouge_dec_dir')
@@ -72,6 +76,10 @@ class BeamSearch(object):
         start = time.time()
         counter = 0
         batch = self.batcher.next_batch()
+        
+        decoded_result = []
+        refered_result = []
+        article_result = []
         while batch is not None:
             # Run beam search to get best Hypothesis
             best_summary = self.beam_search(batch)
@@ -89,9 +97,27 @@ class BeamSearch(object):
                 decoded_words = decoded_words
 
             original_abstract_sents = batch.original_abstracts_sents[0]
+            article = batch.original_articles[0]
 
-            write_for_rouge(original_abstract_sents, decoded_words, counter,
-                            self._rouge_ref_dir, self._rouge_dec_dir)
+            #write_for_rouge(original_abstract_sents, decoded_words, counter,
+            #                self._rouge_ref_dir, self._rouge_dec_dir)
+            decoded_sents = []
+            while len(decoded_words) > 0:
+                try:
+                    fst_period_idx = decoded_words.index(".")
+                except ValueError:
+                    fst_period_idx = len(decoded_words)
+                sent = decoded_words[:fst_period_idx + 1]
+                decoded_words = decoded_words[fst_period_idx + 1:]
+                decoded_sents.append(' '.join(sent))
+
+  # pyrouge calls a perl script that puts the data into HTML files.
+  # Therefore we need to make our output HTML safe.
+            decoded_sents = [make_html_safe(w) for w in decoded_sents]
+            reference_sents = [make_html_safe(w) for w in original_abstract_sents]
+            decoded_result.append(' '.join(decoded_sents))
+            refered_result.append(' '.join(reference_sents))
+            article_result.append(article)
             counter += 1
             if counter % 1000 == 0:
                 print('%d example in %d sec'%(counter, time.time() - start))
@@ -101,8 +127,44 @@ class BeamSearch(object):
 
         print("Decoder has finished reading dataset for single_pass.")
         print("Now starting ROUGE eval...")
-        results_dict = rouge_eval(self._rouge_ref_dir, self._rouge_dec_dir)
-        rouge_log(results_dict, self._decode_dir)
+        load_file = self.model_path_name
+        self.print_original_predicted(decoded_result, refered_result,
+                                          article_result, load_file)
+
+        rouge = Rouge() 
+        scores = rouge.get_scores(decoded_result, refered_result)
+        rouge_1 = sum([x["rouge-1"]["f"] for x in scores]) / len(scores)
+        rouge_2 = sum([x["rouge-2"]["f"] for x in scores]) / len(scores)
+        rouge_l = sum([x["rouge-l"]["f"] for x in scores]) / len(scores)
+        rouge_1_r = sum([x["rouge-1"]["r"] for x in scores]) / len(scores)
+        rouge_2_r = sum([x["rouge-2"]["r"] for x in scores]) / len(scores)
+        rouge_l_r = sum([x["rouge-l"]["r"] for x in scores]) / len(scores)
+        rouge_1_p = sum([x["rouge-1"]["p"] for x in scores]) / len(scores)
+        rouge_2_p = sum([x["rouge-2"]["p"] for x in scores]) / len(scores)
+        rouge_l_p = sum([x["rouge-l"]["p"] for x in scores]) / len(scores)
+        log_str = " rouge_1:" + "%.4f" % rouge_1 + " rouge_2:" + "%.4f" % rouge_2 + " rouge_l:" + "%.4f" % rouge_l
+        log_str_r = " rouge_1_r:" + "%.4f" % rouge_1_r + " rouge_2_r:" + "%.4f" % rouge_2_r + " rouge_l_r:" + "%.4f" % rouge_l_r
+        logger.info(load_file + " rouge_1:" + "%.4f" % rouge_1 + " rouge_2:" + "%.4f" % rouge_2 + " rouge_l:" + "%.4f" % rouge_l)
+        log_str_p = " rouge_1_p:" + "%.4f" % rouge_1_p + " rouge_2_p:" + "%.4f" % rouge_2_p + " rouge_l_p:" + "%.4f" % rouge_l_p
+        results_file = os.path.join(self._decode_dir, "ROUGE_results.txt")
+        with open(results_file, "w") as f:
+            f.write(log_str+'\n')
+            f.write(log_str_r + '\n')
+            f.write(log_str_p + '\n')
+
+
+        #results_dict = rouge_eval(self._rouge_ref_dir, self._rouge_dec_dir)
+        #rouge_log(results_dict, self._decode_dir)
+    
+    def print_original_predicted(self, decoded_sents, ref_sents, article_sents,
+                                 loadfile):
+        filename = "test_" + loadfile.split("_")[1] + ".txt"
+
+        with open(os.path.join(self._rouge_dec_dir, filename), "w") as f:
+            for i in range(len(decoded_sents)):
+                f.write("article: " + article_sents[i] + "\n")
+                f.write("ref: " + ref_sents[i] + "\n")
+                f.write("dec: " + decoded_sents[i] + "\n\n")
 
 
     def beam_search(self, batch):
@@ -123,7 +185,7 @@ class BeamSearch(object):
                       state=(dec_h[0], dec_c[0]),
                       context = c_t_0[0],
                       coverage=(coverage_t_0[0] if config.is_coverage else None))
-                 for _ in xrange(config.beam_size)]
+                 for _ in range(config.beam_size)]
         results = []
         steps = 0
         while steps < config.max_dec_steps and len(results) < config.beam_size:
@@ -167,13 +229,13 @@ class BeamSearch(object):
 
             all_beams = []
             num_orig_beams = 1 if steps == 0 else len(beams)
-            for i in xrange(num_orig_beams):
+            for i in range(num_orig_beams):
                 h = beams[i]
                 state_i = (dec_h[i], dec_c[i])
                 context_i = c_t[i]
                 coverage_i = (coverage_t[i] if config.is_coverage else None)
 
-                for j in xrange(config.beam_size * 2):  # for each of the top 2*beam_size hyps:
+                for j in range(config.beam_size * 2):  # for each of the top 2*beam_size hyps:
                     new_beam = h.extend(token=topk_ids[i, j].item(),
                                    log_prob=topk_log_probs[i, j].item(),
                                    state=state_i,
@@ -201,8 +263,19 @@ class BeamSearch(object):
         return beams_sorted[0]
 
 if __name__ == '__main__':
-    model_filename = sys.argv[1]
-    beam_Search_processor = BeamSearch(model_filename)
-    beam_Search_processor.decode()
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start_from", type=str, default="0005000.tar")
+    opt = parser.parse_args()
+
+    saved_models = os.listdir(config.save_model_path)
+    saved_models.sort(key=lambda x: int(x[:-4].split('_')[1]))
+    print(saved_models)
+    file_idx = saved_models.index(opt.start_from)
+    saved_models = saved_models[file_idx:]
+    for f in saved_models:
+        model_filename = config.save_model_path + '/' + f 
+        beam_Search_processor = BeamSearch(model_filename)
+        beam_Search_processor.decode()
 
 
