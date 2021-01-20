@@ -56,6 +56,13 @@ class Train(object):
         torch.save(state, model_save_path)
 
     def setup_train(self, model_file_path=None):
+
+        # 训练设置，包括
+        if self.opt.load_model != None:
+            model_file_path = os.path.join(self.model_dir, self.opt.load_model)
+        else:
+            model_file_path = None
+
         self.model = Model(model_file_path)
 
         params = list(self.model.encoder.parameters()) + list(self.model.decoder.parameters()) + \
